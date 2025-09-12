@@ -1,0 +1,57 @@
+name: Build & Release (tagged)
+
+on:
+  push:
+    tags:
+      - "v*"   # e.g., v1.0.0
+
+permissions:
+  contents: write  # needed to create releases & upload assets
+
+jobs:
+  build-and-release:
+    runs-on: self-hosted
+
+    # Run the job inside the Luckfox SDK container
+    container:
+      image: luckfoxtech/luckfox_pico:1.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - name: Verify output
+        run: |
+          test -d IMAGE || { echo "ERROR: IMAGE/ folder not found after build"; exit 1; }
+          ls -al IMAGE
+
+      - name: Pack IMAGE folder
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          tar -czf "IMAGE-${VERSION}.tar.gz" IMAGE
+          echo "ASSET=IMAGE-${VERSION}.tar.gz" >> $GITHUB_ENV
+
+      # Optional: keep as CI artifact too (handy for debugging)
+      - name: Upload artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create GitHub Release & Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ASSET }}

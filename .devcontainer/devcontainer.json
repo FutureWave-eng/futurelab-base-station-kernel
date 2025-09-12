@@ -1,0 +1,32 @@
+{
+  "name": "Luckfox Pico SDK",
+  "image": "luckfoxtech/luckfox_pico:1.0",
+
+  // Mount repo exactly like your docker run (-v /home/ubuntu/luckfox-pico:/home)
+  "workspaceFolder": "/home",
+
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/home,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,consistency=cached"
+  ],
+
+  "runArgs": [
+    "--privileged",
+    "--device=/dev/bus/usb"    // gives USB passthrough like your setup
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "ms-azuretools.vscode-docker",
+        "editorconfig.editorconfig"
+      ]
+    }
+  },
+
+  // Optional: keep submodules in sync on first start 
+  "postCreateCommand": "git submodule update --init --recursive || true"
+}
