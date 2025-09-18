@@ -86,7 +86,7 @@
 #define IOCTL_CMD_CMDIN _IOWR(IOCTL_MAGIC, 0x92, u16)
 #define IOCTL_CMD_CMDOUT _IOW(IOCTL_MAGIC, 0x93, u16)
 
-#define PACKLOAD
+/* #define PACKLOAD */
 #undef PACKLOAD
 
 static struct usb_driver ch9344_driver;
@@ -114,6 +114,20 @@ static int ch9344_set_uartmode(struct ch9344 *ch9344, int portnum,
 			       u8 index, u8 mode);
 
 static int ch9344_cmd_out(struct ch9344 *ch9344, u8 *buf, int count);
+
+/* --- Conservative tuning knobs (module params) ------------------------- */
+/* Multiplier for RX URB size: readsize = maxp * rx_urb_mul */
+static ushort rx_urb_mul = 32;
+module_param(rx_urb_mul, ushort, 0444);
+MODULE_PARM_DESC(rx_urb_mul, "RX URB size multiplier (default 32)");
+/* Number of RX URBs to queue (clamped to CH9344_NR) */
+static ushort rx_urb_nr = 16;
+module_param(rx_urb_nr, ushort, 0444);
+MODULE_PARM_DESC(rx_urb_nr, "Number of RX URBs (default 16)");
+/* Minimum UART receive timeout (device-side), in chip ticks */
+static ushort rx_timeout_min = 5;
+module_param(rx_timeout_min, ushort, 0644);
+MODULE_PARM_DESC(rx_timeout_min, "Minimum RX timeout tick (default 5)");
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0))
 
@@ -937,10 +951,11 @@ static void timer_function(struct timer_list *t)
 }
 #endif
 
+
 static void ch9344_process_read_urb(struct ch9344 *ch9344, struct urb *urb)
 {
 	int size;
-	char buffer[512];
+	unsigned char *data;
 	int i = 0;
 	int portnum;
 	u8 usblen;
@@ -948,6 +963,8 @@ static void ch9344_process_read_urb(struct ch9344 *ch9344, struct urb *urb)
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0))
 	struct tty_struct *tty;
 #endif
+	/* bitmask of ports that got data in this URB; we push once per port */
+	unsigned int push_mask = 0;
 
 	if (ch9344->chiptype == CHIP_CH9344L ||
 	    ch9344->chiptype == CHIP_CH9344Q) {
@@ -962,16 +979,15 @@ static void ch9344_process_read_urb(struct ch9344 *ch9344, struct urb *urb)
 	if (!urb->actual_length)
 		return;
 	size = urb->actual_length;
-
-	memcpy(buffer, urb->transfer_buffer, urb->actual_length);
+	data = urb->transfer_buffer;
 
 	for (i = 0; i < size; i += 32) {
-		portnum = *(buffer + i);
+		portnum = *(data + i);
 		if (portnum < left || portnum >= right) {
 			break;
 		}
 		portnum -= ch9344->port_offset;
-		usblen = *(buffer + i + 1);
+		usblen = *(data + i + 1);
 		if (usblen > 30) {
 			break;
 		}
@@ -980,32 +996,39 @@ static void ch9344_process_read_urb(struct ch9344 *ch9344, struct urb *urb)
 #ifndef PACKLOAD
 			ch9344->ttyport[portnum].iocount.rx += usblen;
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0))
-			tty = tty_port_tty_get(
-				&ch9344->ttyport[portnum].port);
+			tty = tty_port_tty_get(&ch9344->ttyport[portnum].port);
 			if (tty) {
-				tty_insert_flip_string(tty, buffer + i + 2,
-						       usblen);
-				tty_flip_buffer_push(tty);
+				tty_insert_flip_string(tty, data + i + 2, usblen);
+				/* push deferred to after loop */
 				tty_kref_put(tty);
+				push_mask |= (1u << portnum);
 			}
 #else
-			tty_insert_flip_string(
-				&ch9344->ttyport[portnum].port,
-				buffer + i + 2, usblen);
-			tty_flip_buffer_push(
-				&ch9344->ttyport[portnum].port);
+			tty_insert_flip_string(&ch9344->ttyport[portnum].port,
+					       data + i + 2, usblen);
+			push_mask |= (1u << portnum);
 #endif
 #else
-			kfifo_in(&ch9344->ttyport[portnum].rfifo,
-				 buffer + i + 2, usblen);
-			mod_timer(
-				&ch9344->ttyport[portnum].timer,
-				jiffies +
-					ch9344->ttyport[portnum].interval);
+			kfifo_in(&ch9344->ttyport[portnum].rfifo, data + i + 2, usblen);
+			mod_timer(&ch9344->ttyport[portnum].timer,
+				  jiffies + ch9344->ttyport[portnum].interval);
 #endif
 		}
 	}
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0))
+	/* old kernels: flip push occurred via tty pointer; nothing to do */
+#else
+	if (push_mask) {
+		int p;
+		for (p = 0; p < ch9344->num_ports; ++p) {
+			if (push_mask & (1u << p))
+				tty_flip_buffer_push(&ch9344->ttyport[p].port);
+		}
+	}
+#endif
 }
+
 
 static void ch9344_read_bulk_callback(struct urb *urb)
 {
@@ -2166,11 +2189,15 @@ static void cal_outdata(char *buffer, u8 rol, u8 xor)
 static u8 cal_recv_tmt(__le32 bd)
 {
 	int dly = 1000000 * 15 / bd;
-
+	u8 val;
 	if (bd >= 921600)
-		return 5;
-
-	return (dly / 100 + 1);
+		val = 5;
+	else
+		val = (dly / 100 + 1);
+	/* apply floor from module param, clamp to u8 */
+	if (rx_timeout_min > val)
+		val = (rx_timeout_min > 255) ? 255 : (u8)rx_timeout_min;
+	return val;
 }
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
@@ -2860,7 +2887,8 @@ static int ch9344_probe(struct usb_interface *intf,
 	u8 *buf;
 	unsigned long quirks;
 	int num_rx_buf = CH9344_NR;
-	int i, index;
+	
+int i, index;
 	struct device *tty_dev;
 	int rv = -ENOMEM;
 
@@ -2902,7 +2930,10 @@ static int ch9344_probe(struct usb_interface *intf,
 	}
 
 	cmdsize = usb_endpoint_maxp(epcmdread);
-	readsize = usb_endpoint_maxp(epread);
+	/* Conservative coalescing: bigger RX URBs & deeper queue (clamped) */
+readsize = usb_endpoint_maxp(epread) * (rx_urb_mul ? rx_urb_mul : 1);
+if (readsize < usb_endpoint_maxp(epread))
+    readsize = usb_endpoint_maxp(epread);
 	ch9344->writesize = usb_endpoint_maxp(epwrite) * 20;
 	ch9344->data = data_interface;
 	ch9344->minor = minor;
@@ -2974,7 +3005,12 @@ static int ch9344_probe(struct usb_interface *intf,
 	if (!ch9344->cmdreadurb)
 		goto alloc_fail5;
 
-	for (i = 0; i < num_rx_buf; i++) {
+	/* clamp number of RX URBs to CH9344_NR if module param provided, before use */
+if (rx_urb_nr > 0) {
+    if (rx_urb_nr < CH9344_NR) num_rx_buf = rx_urb_nr;
+    else num_rx_buf = CH9344_NR;
+}
+for (i = 0; i < num_rx_buf; i++) {
 		struct ch9344_rb *rb = &(ch9344->read_buffers[i]);
 		struct urb *urb;
 

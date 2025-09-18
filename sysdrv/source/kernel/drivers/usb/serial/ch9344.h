@@ -90,7 +90,7 @@
 #define FIFOSIZE 4096
 
 #define CH9344_NW 4
-#define CH9344_NR 4
+#define CH9344_NR 16
 
 #define NUMSTEP 8
 #define MAXGPIO 48
